@@ -330,10 +330,50 @@ export async function fetchUsageFromAPI(
   }
 }
 
+// Disk cache path for persisting usage data across process invocations
+const DISK_CACHE_PATH = path.join(os.homedir(), ".claude", "claude-limitline-cache.json");
+
+interface DiskCache {
+  usage: OAuthUsageResponse | null;
+  previousUsage: OAuthUsageResponse | null;
+  timestamp: number;
+}
+
+function readDiskCache(): DiskCache | null {
+  try {
+    if (fs.existsSync(DISK_CACHE_PATH)) {
+      const raw = fs.readFileSync(DISK_CACHE_PATH, "utf-8");
+      const parsed = JSON.parse(raw) as DiskCache;
+      // Rehydrate Date objects
+      const rehydrate = (u: OAuthUsageResponse | null): OAuthUsageResponse | null => {
+        if (!u) return null;
+        const fix = (d: UsageData | null): UsageData | null =>
+          d ? { ...d, resetAt: new Date(d.resetAt) } : null;
+        return { ...u, fiveHour: fix(u.fiveHour), sevenDay: fix(u.sevenDay), sevenDayOpus: fix(u.sevenDayOpus), sevenDaySonnet: fix(u.sevenDaySonnet) };
+      };
+      return { usage: rehydrate(parsed.usage), previousUsage: rehydrate(parsed.previousUsage), timestamp: parsed.timestamp };
+    }
+  } catch (error) {
+    debug("Failed to read disk cache:", error);
+  }
+  return null;
+}
+
+function writeDiskCache(cache: DiskCache): void {
+  try {
+    fs.writeFileSync(DISK_CACHE_PATH, JSON.stringify(cache), "utf-8");
+  } catch (error) {
+    debug("Failed to write disk cache:", error);
+  }
+}
+
+// Load persisted cache on module init
+const _diskCache = readDiskCache();
+
 // Cache for API responses to avoid hitting rate limits
-let cachedUsage: OAuthUsageResponse | null = null;
-let previousUsage: OAuthUsageResponse | null = null;  // For trend tracking
-let cacheTimestamp = 0;
+let cachedUsage: OAuthUsageResponse | null = _diskCache?.usage ?? null;
+let previousUsage: OAuthUsageResponse | null = _diskCache?.previousUsage ?? null;  // For trend tracking
+let cacheTimestamp = _diskCache?.timestamp ?? 0;
 let cachedToken: string | null = null;
 
 export type TrendDirection = "up" | "down" | "same" | null;
@@ -405,6 +445,7 @@ export async function getRealtimeUsage(
     previousUsage = cachedUsage;
     cachedUsage = usage;
     cacheTimestamp = now;
+    writeDiskCache({ usage: cachedUsage, previousUsage, timestamp: cacheTimestamp });
     debug("Refreshed realtime usage cache");
   } else {
     // Token might be expired, clear it for retry next time
@@ -419,4 +460,5 @@ export function clearUsageCache(): void {
   previousUsage = null;
   cacheTimestamp = 0;
   cachedToken = null;
+  try { fs.unlinkSync(DISK_CACHE_PATH); } catch { /* ignore */ }
 }
